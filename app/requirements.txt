@@ -8,6 +8,7 @@ statsmodels>=0.14.2
 scipy>=1.13.1
 scikit-learn>=1.5.0
 reportlab>=4.2.2
+requests>=2.31.0
 
 # The requirements using the Jupyter Notebook (EDA) are listed below.
 
@@ -19,3 +20,4 @@ statsmodels>=0.14.2
 scipy>=1.13.1
 scikit-learn>=1.5.0
 ipython>=8.27.0
+

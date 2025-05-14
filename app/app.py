@@ -17,16 +17,25 @@ import time
 import math
 import io
 import base64
+import pyarrow.parquet as pq
+import requests
+import hashlib
+import os
 
 # Page configuration
 st.set_page_config(
     page_title="COVID-19 Advanced Analytics Dashboard",
     page_icon="🦠",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://your-help-url.com',
+        'Report a bug': 'https://your-bug-report-url.com',
+        'About': 'COVID-19 Analytics Dashboard v1.0'
+    }
 )
 
-# Custom CSS to improve appearance
+# Custom CSS (unchanged)
 st.markdown("""
     <style>
     .main-header {
@@ -100,70 +109,156 @@ st.markdown("""
 st.markdown("<h1 class='main-header'>🌍 COVID-19 Advanced Analytics Dashboard</h1>", unsafe_allow_html=True)
 st.markdown("Comprehensive analysis of global pandemic data with advanced statistical insights and forecasting")
 
+# Initialize session state for parameters
+if 'parameters' not in st.session_state:
+    st.session_state.parameters = {
+        'selected_countries': ["United States", "United Kingdom", "India", "Brazil", "South Africa"],
+        'include_world': True,
+        'selected_continent': 'All',
+        'start_date': None,  # Will be set after data load
+        'end_date': None,    # Will be set after data load
+        'show_events': True,
+        'anomaly_threshold': 3.0,
+        'normalize_options': "Absolute numbers",
+        'selected_metric_category': "Cases",
+        'selected_metric': "New Cases (7-day avg)"
+    }
+
 # Load data
-@st.cache_data(ttl=3600)
-def load_data():
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_data(_url, _essential_columns, _file_hash):
     """
-    Load COVID-19 data from Our World in Data and perform comprehensive preprocessing.
-    Returns a pandas DataFrame with COVID-19 data.
+    Load COVID-19 data from Our World in Data with chunked loading and save as Parquet.
+    Returns a pandas DataFrame with essential columns.
     """
     try:
-        url = "data/owid-covid-data.csv"
-        df = pd.read_csv(url, parse_dates=['date'])
-        
-        # Comprehensive data preprocessing
+        # Check for cached Parquet file
+        cache_file = "covid_data_cache.parquet"
+        cache_hash_file = "covid_data_cache_hash.txt"
+        if os.path.exists(cache_file) and os.path.exists(cache_hash_file):
+            with open(cache_hash_file, 'r') as f:
+                cached_hash = f.read().strip()
+            if cached_hash == _file_hash:
+                cached_df = pq.read_table(cache_file).to_pandas()
+                if set(_essential_columns).issubset(cached_df.columns):
+                    return cached_df[_essential_columns]
+
+        # Initialize progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        status_text.text("Loading data (1/3): Reading CSV...")
+
+        # Chunked loading
+        chunks = pd.read_csv(_url, parse_dates=['date'], chunksize=10000)
+        df_chunks = []
+        total_chunks = 10  # Estimate for progress; adjust based on data size
+        for i, chunk in enumerate(chunks):
+            df_chunks.append(chunk[_essential_columns])
+            progress = min((i + 1) / total_chunks, 0.33)
+            progress_bar.progress(progress)
+            status_text.text(f"Loading data (1/3): Processing chunk {i + 1}...")
+
+        df = pd.concat(df_chunks, ignore_index=True)
+        status_text.text("Loading data (2/3): Preprocessing essential columns...")
+
+        # Basic preprocessing for essential columns
         numeric_columns = df.select_dtypes(include=[np.number]).columns
         for col in numeric_columns:
             df[col] = df[col].fillna(0)
-        
-        # Calculate rolling averages and rates of change
-        for col in ['new_cases', 'new_deaths']:
-            if col in df.columns:
-                df[f'{col}_7day_avg'] = df.groupby('location')[col].transform(
-                    lambda x: x.rolling(window=7, min_periods=1).mean())
-                df[f'{col}_14day_avg'] = df.groupby('location')[col].transform(
-                    lambda x: x.rolling(window=14, min_periods=1).mean())
-                df[f'{col}_growth_rate'] = df.groupby('location')[f'{col}_7day_avg'].transform(
-                    lambda x: x.pct_change(periods=7).fillna(0) * 100)
-                df[f'{col}_acceleration'] = df.groupby('location')[f'{col}_growth_rate'].transform(
-                    lambda x: x.diff().fillna(0))
 
-        # Calculate per capita metrics
-        if 'population' in df.columns:
-            for col in ['total_cases', 'total_deaths', 'new_cases', 'new_deaths']:
-                if col in df.columns:
-                    df[f'{col}_per_million'] = df[col] * 1000000 / df['population']
-            if 'total_tests' in df.columns and 'total_cases' in df.columns:
-                df['tests_per_case'] = df['total_tests'] / df['total_cases'].replace(0, np.nan)
-            if 'total_cases' in df.columns and 'total_deaths' in df.columns:
-                df['case_fatality_rate'] = (df['total_deaths'] / df['total_cases'].replace(0, np.nan)) * 100
-            if 'reproduction_rate' not in df.columns and 'new_cases_7day_avg' in df.columns:
-                df['approx_reproduction_rate'] = df.groupby('location')['new_cases_7day_avg'].transform(
-                    lambda x: x / x.shift(7).replace(0, np.nan))
-        
-        # Date-related features
-        df['year'] = df['date'].dt.year
-        df['month'] = df['date'].dt.month
-        df['week'] = df['date'].dt.isocalendar().week
-        df['day_of_week'] = df['date'].dt.dayofweek
-        
-        # Wave indicators
+        # Calculate essential rolling averages
+        if 'new_cases' in df.columns:
+            df['new_cases_7day_avg'] = df.groupby('location')['new_cases'].transform(
+                lambda x: x.rolling(window=7, min_periods=1).mean())
+        if 'new_deaths' in df.columns:
+            df['new_deaths_7day_avg'] = df.groupby('location')['new_deaths'].transform(
+                lambda x: x.rolling(window=7, min_periods=1).mean())
+
+        # Save to Parquet and store hash
+        df.to_parquet(cache_file, index=False)
+        with open(cache_hash_file, 'w') as f:
+            f.write(_file_hash)
+        progress_bar.progress(0.66)
+        status_text.text("Loading data (3/3): Saving cache...")
+
+        progress_bar.progress(1.0)
+        status_text.text("Data loaded successfully!")
+        time.sleep(0.5)  # Brief pause for user feedback
+        progress_bar.empty()
+        status_text.empty()
+
+        return df
+    except Exception as e:
+        st.error(f"Failed to load data: {e}")
+        return pd.DataFrame(columns=['date', 'location', 'iso_code', 'new_cases', 'new_deaths',
+                                    'total_cases', 'total_deaths', 'population'])
+@st.cache_data(ttl=3600, show_spinner=False)
+def preprocess_advanced_metrics(_df):
+    """
+    Perform advanced preprocessing for non-essential metrics.
+    Returns DataFrame with additional computed columns.
+    """
+    df = _df.copy()
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text("Preprocessing (1/3): Calculating growth rates...")
+
+    # Calculate growth rates and advanced metrics
+    for col in ['new_cases', 'new_deaths']:
+        if col in df.columns:
+            df[f'{col}_14day_avg'] = df.groupby('location')[col].transform(
+                lambda x: x.rolling(window=14, min_periods=1).mean())
+            df[f'{col}_growth_rate'] = df.groupby('location')[f'{col}_7day_avg'].transform(
+                lambda x: x.pct_change(periods=7).fillna(0) * 100)
+            df[f'{col}_acceleration'] = df.groupby('location')[f'{col}_growth_rate'].transform(
+                lambda x: x.diff().fillna(0))
+
+    progress_bar.progress(0.33)
+    status_text.text("Preprocessing (2/3): Calculating per capita metrics...")
+
+    # Calculate per capita metrics
+    if 'population' in df.columns:
+        for col in ['total_cases', 'total_deaths', 'new_cases', 'new_deaths']:
+            if col in df.columns:
+                df[f'{col}_per_million'] = df[col] * 1000000 / df['population']
+        if 'total_tests' in df.columns and 'total_cases' in df.columns:
+            df['tests_per_case'] = df['total_tests'] / df['total_cases'].replace(0, np.nan)
+        if 'total_cases' in df.columns and 'total_deaths' in df.columns:
+            df['case_fatality_rate'] = (df['total_deaths'] / df['total_cases'].replace(0, np.nan)) * 100
+        if 'reproduction_rate' not in df.columns and 'new_cases_7day_avg' in df.columns:
+            df['approx_reproduction_rate'] = df.groupby('location')['new_cases_7day_avg'].transform(
+                lambda x: x / x.shift(7).replace(0, np.nan))
+
+    progress_bar.progress(0.66)
+    status_text.text("Preprocessing (3/3): Adding date features and wave indicators...")
+
+    # Date-related features
+    df['year'] = df['date'].dt.year
+    df['month'] = df['date'].dt.month
+    df['week'] = df['date'].dt.isocalendar().week
+    df['day_of_week'] = df['date'].dt.dayofweek
+
+    # Wave indicators
+    if 'new_cases_7day_avg' in df.columns:
         df['new_cases_trend'] = df.groupby('location')['new_cases_7day_avg'].transform(
             lambda x: np.sign(x.diff()))
         df['wave_change'] = df.groupby('location')['new_cases_trend'].transform(
             lambda x: x.diff().fillna(0) != 0).astype(int)
-        
-        # Continent mapping
-        if 'continent' not in df.columns and 'iso_code' in df.columns:
-            continent_map = df[df['iso_code'].str.len() == 2].drop_duplicates('location').set_index('location')['continent'].to_dict()
-            df['continent'] = df['location'].map(continent_map)
-        
-        return df
-    except Exception as e:
-        st.error(f"Failed to load data: {e}")
-        return pd.DataFrame(columns=['date', 'location', 'iso_code', 'new_cases', 'new_deaths', 
-                                    'total_cases', 'total_deaths', 'population'])
 
+    # Continent mapping
+    if 'continent' not in df.columns and 'iso_code' in df.columns:
+        continent_map = df[df['iso_code'].str.len() == 2].drop_duplicates('location').set_index('location')['continent'].to_dict()
+        df['continent'] = df['location'].map(continent_map)
+
+    progress_bar.progress(1.0)
+    status_text.text("Preprocessing complete!")
+    time.sleep(0.5)
+    progress_bar.empty()
+    status_text.empty()
+
+    return df
+
+# Functions (unchanged from original)
 def get_significant_date_events():
     """Return dictionary of significant COVID-19 timeline events"""
     return {
@@ -322,7 +417,7 @@ def run_statistical_analysis(country_data, metric='new_cases_7day_avg'):
     if len(data) >= 14:
         recent_growth = (data.iloc[-1] / data.iloc[-14] - 1) * 100 if data.iloc[-14] > 0 else 0
         results['recent_growth_rate'] = recent_growth
-        growth_text = "increasing" if recent_growth > 10 else ("decreasing" if recent_growth < -10 else "stable")
+        growth_text = " personally think this is a good place to implement the functionality that automatically loads the parameters one clicks into (i just want to improve the loading part it takes  some time to load feeds)increasing" if recent_growth > 10 else ("decreasing" if recent_growth < -10 else "stable")
         insights.append(f"Trend: {growth_text} ({recent_growth:.1f}% change over last 14 days)")
     q1 = data.quantile(0.25)
     q3 = data.quantile(0.75)
@@ -698,434 +793,549 @@ def analyze_policy_impact(df, countries):
 
 # Main application
 try:
-    with st.spinner('Loading COVID-19 data...'):
-        df = load_data()
-        if df.empty:
-            st.error("No data loaded. Check internet connection or data source.")
-            st.stop()
-        last_update = df['date'].max().strftime('%Y-%m-%d')
-        data_date_range = f"{df['date'].min().strftime('%Y-%m-%d')} to {last_update}"
-        st.sidebar.info(f"Data range: {data_date_range}")
-        st.sidebar.info(f"Countries/regions: {df['location'].nunique()}")
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.metric("Total Countries", f"{df['location'].nunique()}")
-        with col2:
-            st.info(f"Data last updated: {last_update}")
-        continents = ['World', 'Asia', 'Europe', 'Africa', 'North America', 'South America', 'Oceania']
-        countries = sorted([c for c in df['location'].unique() if c not in continents])
-        st.sidebar.header("📊 Data Filters")
-        default_countries = ["United States", "United Kingdom", "India", "Brazil", "South Africa"]
-        default_countries = [c for c in default_countries if c in countries]
-        if not default_countries and countries:
-            default_countries = [countries[0]]
-        selected_countries = st.sidebar.multiselect(
-            "Select Countries", countries, default=default_countries
+    # Define essential columns for initial load
+    essential_columns = [
+        'date', 'location', 'iso_code', 'continent', 'new_cases', 'new_deaths',
+        'total_cases', 'total_deaths', 'population', 'people_vaccinated_per_hundred',
+        'stringency_index', 'median_age', 'gdp_per_capita', 'hospital_beds_per_thousand'
+    ]
+
+    # Load essential data
+    # Compute file hash for local file
+    def get_file_hash(file_path):
+        try:
+            with open(file_path, 'rb') as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except Exception:
+            return "default_hash"  # Fallback if file is inaccessible
+
+    # Load essential data
+    file_path = "data/owid-covid-data.csv"
+    file_hash = get_file_hash(file_path)
+    df = load_data(file_path, essential_columns, file_hash)
+    if df.empty:
+        st.error("No data loaded. Check internet connection or data source.")
+        st.stop()
+
+    # Set default dates based on data if not in session state
+    last_update = df['date'].max()
+    if st.session_state.parameters['end_date'] is None:
+        st.session_state.parameters['end_date'] = last_update.date()
+    if st.session_state.parameters['start_date'] is None:
+        st.session_state.parameters['start_date'] = (last_update - timedelta(days=365)).date()
+
+    # Load advanced metrics
+    df = preprocess_advanced_metrics(df)
+
+    # Sidebar and filters
+    last_update_str = last_update.strftime('%Y-%m-%d')
+    data_date_range = f"{df['date'].min().strftime('%Y-%m-%d')} to {last_update_str}"
+    st.sidebar.info(f"Data range: {data_date_range}")
+    st.sidebar.info(f"Countries/regions: {df['location'].nunique()}")
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.metric("Total Countries", f"{df['location'].nunique()}")
+    with col2:
+        st.info(f"Data last updated: {last_update_str}")
+
+    continents = ['World', 'Asia', 'Europe', 'Africa', 'North America', 'South America', 'Oceania']
+    countries = sorted([c for c in df['location'].unique() if c not in continents])
+
+    # Validate session state countries
+    valid_countries = [c for c in st.session_state.parameters['selected_countries'] if c in countries]
+    if not valid_countries and countries:
+        valid_countries = ["United States", "United Kingdom", "India", "Brazil", "South Africa"]
+        valid_countries = [c for c in valid_countries if c in countries]
+        if not valid_countries:
+            valid_countries = [countries[0]]
+    st.session_state.parameters['selected_countries'] = valid_countries
+
+    st.sidebar.header("📊 Data Filters")
+    selected_countries = st.sidebar.multiselect(
+        "Select Countries",
+        countries,
+        default=st.session_state.parameters['selected_countries'],
+        key="selected_countries"
+    )
+    # Update session state
+    st.session_state.parameters['selected_countries'] = selected_countries
+
+    with st.sidebar.expander("Advanced Filters", expanded=False):
+        include_world = st.checkbox(
+            "Include global data",
+            value=st.session_state.parameters['include_world'],
+            key="include_world"
         )
-        with st.sidebar.expander("Advanced Filters", expanded=False):
-            include_world = st.checkbox("Include global data", value=True)
-            if include_world and "World" in df['location'].unique():
-                if "World" not in selected_countries:
-                    selected_countries = ["World"] + selected_countries
-            continent_options = ['All'] + sorted(df['continent'].dropna().unique().tolist())
-            selected_continent = st.selectbox("Select Continent", continent_options)
-            default_end_date = df['date'].max()
-            default_start_date = default_end_date - timedelta(days=365)
-            start_date = st.date_input(
-                "Start Date", value=default_start_date.date(),
-                min_value=df['date'].min().date(), max_value=default_end_date.date()
-            )
-            end_date = st.date_input(
-                "End Date", value=default_end_date.date(),
-                min_value=start_date, max_value=default_end_date.date()
-            )
-            show_events = st.checkbox("Show significant events", value=True)
-            anomaly_threshold = st.slider("Anomaly detection threshold", 2.0, 5.0, 3.0, 0.1)
-            normalize_options = st.radio(
-                "Data normalization", ["Absolute numbers", "Per million people", "Per capita (%)"]
-            )
-        st.sidebar.subheader("Select Metrics")
-        available_metrics = {
-            "Cases": {
-                "New Cases": "new_cases",
-                "Total Cases": "total_cases",
-                "New Cases (7-day avg)": "new_cases_7day_avg",
-                "Case Growth Rate (%)": "new_cases_growth_rate"
-            },
-            "Deaths": {
-                "New Deaths": "new_deaths",
-                "Total Deaths": "total_deaths",
-                "New Deaths (7-day avg)": "new_deaths_7day_avg",
-                "Death Growth Rate (%)": "new_deaths_growth_rate"
-            }
+        st.session_state.parameters['include_world'] = include_world
+
+        if include_world and "World" in df['location'].unique():
+            if "World" not in selected_countries:
+                selected_countries = ["World"] + selected_countries
+
+        continent_options = ['All'] + sorted(df['continent'].dropna().unique().tolist())
+        selected_continent = st.selectbox(
+            "Select Continent",
+            continent_options,
+            index=continent_options.index(st.session_state.parameters['selected_continent']),
+            key="selected_continent"
+        )
+        st.session_state.parameters['selected_continent'] = selected_continent
+
+        start_date = st.date_input(
+            "Start Date",
+            value=st.session_state.parameters['start_date'],
+            min_value=df['date'].min().date(),
+            max_value=df['date'].max().date(),
+            key="start_date"
+        )
+        st.session_state.parameters['start_date'] = start_date
+
+        end_date = st.date_input(
+            "End Date",
+            value=st.session_state.parameters['end_date'],
+            min_value=start_date,
+            max_value=df['date'].max().date(),
+            key="end_date"
+        )
+        st.session_state.parameters['end_date'] = end_date
+
+        show_events = st.checkbox(
+            "Show significant events",
+            value=st.session_state.parameters['show_events'],
+            key="show_events"
+        )
+        st.session_state.parameters['show_events'] = show_events
+
+        anomaly_threshold = st.slider(
+            "Anomaly detection threshold",
+            2.0, 5.0,
+            st.session_state.parameters['anomaly_threshold'],
+            0.1,
+            key="anomaly_threshold"
+        )
+        st.session_state.parameters['anomaly_threshold'] = anomaly_threshold
+
+        normalize_options = st.radio(
+            "Data normalization",
+            ["Absolute numbers", "Per million people", "Per capita (%)"],
+            index=["Absolute numbers", "Per million people", "Per capita (%)"].index(
+                st.session_state.parameters['normalize_options']
+            ),
+            key="normalize_options"
+        )
+        st.session_state.parameters['normalize_options'] = normalize_options
+
+    st.sidebar.subheader("Select Metrics")
+    available_metrics = {
+        "Cases": {
+            "New Cases": "new_cases",
+            "Total Cases": "total_cases",
+            "New Cases (7-day avg)": "new_cases_7day_avg",
+            "Case Growth Rate (%)": "new_cases_growth_rate"
+        },
+        "Deaths": {
+            "New Deaths": "new_deaths",
+            "Total Deaths": "total_deaths",
+            "New Deaths (7-day avg)": "new_deaths_7day_avg",
+            "Death Growth Rate (%)": "new_deaths_growth_rate"
         }
-        if 'people_vaccinated_per_hundred' in df.columns:
-            available_metrics["Vaccination"] = {
-                "Vaccination Rate (%)": "people_vaccinated_per_hundred",
-                "Fully Vaccinated (%)": "people_fully_vaccinated_per_hundred",
-                "Booster Rate (%)": "total_boosters_per_hundred" if "total_boosters_per_hundred" in df.columns else None
-            }
-            available_metrics["Vaccination"] = {k: v for k, v in available_metrics["Vaccination"].items() if v is not None}
-        hospital_metrics = {}
-        for col in ['icu_patients', 'hosp_patients', 'new_tests', 'positive_rate']:
-            if col in df.columns:
-                hospital_metrics[col.replace('_', ' ').title()] = col
-        if hospital_metrics:
-            available_metrics["Healthcare"] = hospital_metrics
-        selected_metric_category = st.sidebar.selectbox("Metric Category", list(available_metrics.keys()))
-        selected_metric = st.sidebar.selectbox("Select Metric", list(available_metrics[selected_metric_category].keys()))
-        metric_column = available_metrics[selected_metric_category][selected_metric]
-        if not selected_countries:
-            st.warning("Please select at least one country.")
-            st.stop()
-        filtered_df = df[
-            (df['location'].isin(selected_countries)) &
-            (df['date'] >= pd.Timestamp(start_date)) &
-            (df['date'] <= pd.Timestamp(end_date))
-        ]
-        if selected_continent != 'All':
-            filtered_df = filtered_df[filtered_df['continent'] == selected_continent]
-        if filtered_df.empty:
-            st.warning("No data available for selected filters.")
-            st.stop()
-        if normalize_options == "Per million people":
-            display_suffix = "_per_million"
-            if f"{metric_column}{display_suffix}" in filtered_df.columns:
-                display_metric = f"{metric_column}{display_suffix}"
-                metric_title = f"{selected_metric} per Million People"
-            else:
-                if 'population' in filtered_df.columns:
-                    filtered_df[f"{metric_column}_per_million"] = filtered_df.apply(
-                        lambda row: row[metric_column] * 1000000 / row['population'] 
-                        if pd.notna(row['population']) and row['population'] > 0 else np.nan, axis=1
-                    )
-                    display_metric = f"{metric_column}_per_million"
-                    metric_title = f"{selected_metric} per Million People"
-                else:
-                    display_metric = metric_column
-                    metric_title = selected_metric
-                    st.warning("Population data not available for per million calculation")
-        elif normalize_options == "Per capita (%)":
-            display_suffix = "_per_capita_pct"
+    }
+    if 'people_vaccinated_per_hundred' in df.columns:
+        available_metrics["Vaccination"] = {
+            "Vaccination Rate (%)": "people_vaccinated_per_hundred",
+            "Fully Vaccinated (%)": "people_fully_vaccinated_per_hundred",
+            "Booster Rate (%)": "total_boosters_per_hundred" if "total_boosters_per_hundred" in df.columns else None
+        }
+        available_metrics["Vaccination"] = {k: v for k, v in available_metrics["Vaccination"].items() if v is not None}
+    hospital_metrics = {}
+    for col in ['icu_patients', 'hosp_patients', 'new_tests', 'positive_rate']:
+        if col in df.columns:
+            hospital_metrics[col.replace('_', ' ').title()] = col
+    if hospital_metrics:
+        available_metrics["Healthcare"] = hospital_metrics
+
+    selected_metric_category = st.sidebar.selectbox(
+        "Metric Category",
+        list(available_metrics.keys()),
+        index=list(available_metrics.keys()).index(st.session_state.parameters['selected_metric_category']),
+        key="selected_metric_category"
+    )
+    st.session_state.parameters['selected_metric_category'] = selected_metric_category
+
+    selected_metric = st.sidebar.selectbox(
+        "Select Metric",
+        list(available_metrics[selected_metric_category].keys()),
+        index=list(available_metrics[selected_metric_category].keys()).index(st.session_state.parameters['selected_metric']),
+        key="selected_metric"
+    )
+    st.session_state.parameters['selected_metric'] = selected_metric
+
+    metric_column = available_metrics[selected_metric_category][selected_metric]
+
+    if not selected_countries:
+        st.warning("Please select at least one country.")
+        st.stop()
+
+    filtered_df = df[
+        (df['location'].isin(selected_countries)) &
+        (df['date'] >= pd.Timestamp(start_date)) &
+        (df['date'] <= pd.Timestamp(end_date))
+    ]
+    if selected_continent != 'All':
+        filtered_df = filtered_df[filtered_df['continent'] == selected_continent]
+
+    if filtered_df.empty:
+        st.warning("No data available for selected filters.")
+        st.stop()
+
+    if normalize_options == "Per million people":
+        display_suffix = "_per_million"
+        if f"{metric_column}{display_suffix}" in filtered_df.columns:
+            display_metric = f"{metric_column}{display_suffix}"
+            metric_title = f"{selected_metric} per Million People"
+        else:
             if 'population' in filtered_df.columns:
-                filtered_df[f"{metric_column}{display_suffix}"] = filtered_df.apply(
-                    lambda row: row[metric_column] * 100 / row['population'] 
+                filtered_df[f"{metric_column}_per_million"] = filtered_df.apply(
+                    lambda row: row[metric_column] * 1000000 / row['population'] 
                     if pd.notna(row['population']) and row['population'] > 0 else np.nan, axis=1
                 )
-                display_metric = f"{metric_column}{display_suffix}"
-                metric_title = f"{selected_metric} (% of Population)"
+                display_metric = f"{metric_column}_per_million"
+                metric_title = f"{selected_metric} per Million People"
             else:
                 display_metric = metric_column
                 metric_title = selected_metric
-                st.warning("Population data not available for per capita calculation")
+                st.warning("Population data not available for per million calculation")
+    elif normalize_options == "Per capita (%)":
+        display_suffix = "_per_capita_pct"
+        if 'population' in filtered_df.columns:
+            filtered_df[f"{metric_column}{display_suffix}"] = filtered_df.apply(
+                lambda row: row[metric_column] * 100 / row['population'] 
+                if pd.notna(row['population']) and row['population'] > 0 else np.nan, axis=1
+            )
+            display_metric = f"{metric_column}{display_suffix}"
+            metric_title = f"{selected_metric} (% of Population)"
         else:
             display_metric = metric_column
             metric_title = selected_metric
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "📈 Trends & Insights", "🔍 Statistical Analysis", "🗺️ Geographic Analysis",
-            "🧮 Comparative Analysis", "🔮 Forecasting & Modeling"
-        ])
-        with tab1:
-            st.markdown(f"<h2 class='chart-header'>{metric_title} Analysis</h2>", unsafe_allow_html=True)
-            try:
-                fig = px.line(
-                    filtered_df, x='date', y=display_metric, color='location',
-                    title=f"{metric_title} Trends Over Time",
-                    labels={'date': 'Date', display_metric: metric_title, 'location': 'Country'}
-                )
-                if show_events:
-                    fig = add_timeline_events(fig, start_date, end_date)
-                fig.update_layout(
-                    height=500, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20)
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                with st.expander("📊 Trend Insights", expanded=True):
-                    trends_col1, trends_col2 = st.columns(2)
-                    with trends_col1:
-                        st.markdown("### Key Observations")
-                        latest_by_country = filtered_df.sort_values('date').groupby('location').tail(1)
-                        latest_by_country = latest_by_country.sort_values(display_metric, ascending=False)
-                        if len(latest_by_country) > 1:
-                            highest = latest_by_country.iloc[0]
-                            lowest = latest_by_country.iloc[-1]
-                            st.markdown(f"- **Highest {metric_title}**: {highest['location']} ({highest[display_metric]:.2f})")
-                            st.markdown(f"- **Lowest {metric_title}**: {lowest['location']} ({lowest[display_metric]:.2f})")
-                        if len(filtered_df) >= 14:
-                            recent_by_country = filtered_df.sort_values('date').groupby('location').tail(14)
-                            growth_rates = []
-                            for country in selected_countries:
-                                country_recent = recent_by_country[recent_by_country['location'] == country]
-                                if len(country_recent) >= 7:
-                                    first_value = country_recent.iloc[0][display_metric]
-                                    last_value = country_recent.iloc[-1][display_metric]
-                                    if first_value > 0:
-                                        growth_rate = ((last_value - first_value) / first_value) * 100
-                                        growth_rates.append((country, growth_rate))
-                            if growth_rates:
-                                fastest_growth = max(growth_rates, key=lambda x: x[1])
-                                fastest_decline = min(growth_rates, key=lambda x: x[1])
-                                st.markdown(f"- **Fastest Growth**: {fastest_growth[0]} ({fastest_growth[1]:.2f}% over 14 days)")
-                                st.markdown(f"- **Biggest Decline**: {fastest_decline[0]} ({fastest_decline[1]:.2f}% over 14 days)")
-                        if len(filtered_df) > 30:
-                            st.markdown("### Detected Patterns")
-                            for country in selected_countries:
-                                country_data = filtered_df[filtered_df['location'] == country]
-                                if len(country_data) > 30:
-                                    weekend_effect = analyze_weekend_effect(country_data, metric_column)
-                                    if weekend_effect and abs(weekend_effect['weekend_effect_pct']) > 10:
-                                        effect_type = "lower" if weekend_effect['weekend_effect_pct'] < 0 else "higher"
-                                        st.markdown(f"- **{country}**: {effect_type} weekend reporting "
-                                                  f"({weekend_effect['weekend_effect_pct']:.1f}%). "
-                                                  f"Lowest on {weekend_effect['min_reporting_day']}.")
-                                    waves = detect_covid_waves(country_data)
-                                    if waves:
-                                        st.markdown(f"- **{country}**: {len(waves)} waves, highest peak on "
-                                                  f"{waves[0]['wave_peak'].strftime('%Y-%m-%d')}.")
-                    with trends_col2:
-                        st.markdown("### Data Quality Analysis")
-                        anomaly_counts = {}
+            st.warning("Population data not available for per capita calculation")
+    else:
+        display_metric = metric_column
+        metric_title = selected_metric
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📈 Trends & Insights", "🔍 Statistical Analysis", "🗺️ Geographic Analysis",
+        "🧮 Comparative Analysis", "🔮 Forecasting & Modeling"
+    ])
+
+    with tab1:
+        st.markdown(f"<h2 class='chart-header'>{metric_title} Analysis</h2>", unsafe_allow_html=True)
+        try:
+            fig = px.line(
+                filtered_df, x='date', y=display_metric, color='location',
+                title=f"{metric_title} Trends Over Time",
+                labels={'date': 'Date', display_metric: metric_title, 'location': 'Country'}
+            )
+            if show_events:
+                fig = add_timeline_events(fig, start_date, end_date)
+            fig.update_layout(
+                height=500, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            with st.expander("📊 Trend Insights", expanded=True):
+                trends_col1, trends_col2 = st.columns(2)
+                with trends_col1:
+                    st.markdown("### Key Observations")
+                    latest_by_country = filtered_df.sort_values('date').groupby('location').tail(1)
+                    latest_by_country = latest_by_country.sort_values(display_metric, ascending=False)
+                    if len(latest_by_country) > 1:
+                        highest = latest_by_country.iloc[0]
+                        lowest = latest_by_country.iloc[-1]
+                        st.markdown(f"- **Highest {metric_title}**: {highest['location']} ({highest[display_metric]:.2f})")
+                        st.markdown(f"- **Lowest {metric_title}**: {lowest['location']} ({lowest[display_metric]:.2f})")
+                    if len(filtered_df) >= 14:
+                        recent_by_country = filtered_df.sort_values('date').groupby('location').tail(14)
+                        growth_rates = []
+                        for country in selected_countries:
+                            country_recent = recent_by_country[recent_by_country['location'] == country]
+                            if len(country_recent) >= 7:
+                                first_value = country_recent.iloc[0][display_metric]
+                                last_value = country_recent.iloc[-1][display_metric]
+                                if first_value > 0:
+                                    growth_rate = ((last_value - first_value) / first_value) * 100
+                                    growth_rates.append((country, growth_rate))
+                        if growth_rates:
+                            fastest_growth = max(growth_rates, key=lambda x: x[1])
+                            fastest_decline = min(growth_rates, key=lambda x: x[1])
+                            st.markdown(f"- **Fastest Growth**: {fastest_growth[0]} ({fastest_growth[1]:.2f}% over 14 days)")
+                            st.markdown(f"- **Biggest Decline**: {fastest_decline[0]} ({fastest_decline[1]:.2f}% over 14 days)")
+                    if len(filtered_df) > 30:
+                        st.markdown("### Detected Patterns")
                         for country in selected_countries:
                             country_data = filtered_df[filtered_df['location'] == country]
-                            country_data = detect_anomalies(country_data, metric_column, window=7)
-                            anomaly_count = country_data[f'{metric_column}_anomaly'].sum()
-                            if anomaly_count > 0:
-                                anomaly_counts[country] = anomaly_count
-                        if anomaly_counts:
-                            st.markdown("#### Anomalies Detected")
-                            for country, count in anomaly_counts.items():
-                                st.markdown(f"- **{country}**: {count} anomalous data points")
-                            st.markdown("Anomalies may indicate reporting issues or significant events.")
-                        else:
-                            st.markdown("No significant anomalies detected.")
-                        missing_data = {}
-                        for country in selected_countries:
-                            country_data = filtered_df[filtered_df['location'] == country]
-                            date_range = pd.date_range(start=country_data['date'].min(), end=country_data['date'].max())
-                            missing_dates = set(date_range) - set(country_data['date'])
-                            if missing_dates:
-                                missing_data[country] = len(missing_dates)
-                        if missing_data:
-                            st.markdown("#### Missing Data Points")
-                            for country, count in missing_data.items():
-                                st.markdown(f"- **{country}**: {count} missing dates")
-                            st.markdown("Missing data may affect trend analysis.")
-                        else:
-                            st.markdown("No missing dates detected.")
-            except Exception as e:
-                st.error(f"Error creating trends chart: {e}")
-            st.markdown("## Country-Specific Insights")
-            country_tabs = st.tabs(selected_countries)
-            for i, country in enumerate(selected_countries):
-                with country_tabs[i]:
-                    country_data = filtered_df[filtered_df['location'] == country].sort_values('date')
-                    if country_data.empty:
-                        st.warning("No data available for this country.")
-                        continue
-                    metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
-                    latest = country_data.iloc[-1]
-                    with metrics_col1:
-                        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-                        st.markdown("<div class='metric-title'>Total Cases</div>", unsafe_allow_html=True)
-                        value = f"{int(latest['total_cases']):,}" if 'total_cases' in latest else "N/A"
-                        st.markdown(f"<div class='metric-value'>{value}</div>", unsafe_allow_html=True)
-                        st.markdown("</div>", unsafe_allow_html=True)
-                    with metrics_col2:
-                        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-                        st.markdown("<div class='metric-title'>Total Deaths</div>", unsafe_allow_html=True)
-                        value = f"{int(latest['total_deaths']):,}" if 'total_deaths' in latest else "N/A"
-                        st.markdown(f"<div class='metric-value'>{value}</div>", unsafe_allow_html=True)
-                        st.markdown("</div>", unsafe_allow_html=True)
-                    with metrics_col3:
-                        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-                        st.markdown("<div class='metric-title'>Case Fatality Rate</div>", unsafe_allow_html=True)
-                        cfr = (latest['total_deaths'] / latest['total_cases'] * 100) if 'total_cases' in latest and latest['total_cases'] > 0 else np.nan
-                        value = f"{cfr:.2f}%" if pd.notna(cfr) else "N/A"
-                        st.markdown(f"<div class='metric-value'>{value}</div>", unsafe_allow_html=True)
-                        st.markdown("</div>", unsafe_allow_html=True)
-                    with metrics_col4:
-                        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-                        st.markdown("<div class='metric-title'>Vaccination Rate</div>", unsafe_allow_html=True)
-                        value = f"{latest['people_vaccinated_per_hundred']:.1f}%" if 'people_vaccinated_per_hundred' in latest and pd.notna(latest['people_vaccinated_per_hundred']) else "N/A"
-                        st.markdown(f"<div class='metric-value'>{value}</div>", unsafe_allow_html=True)
-                        st.markdown("</div>", unsafe_allow_html=True)
-                    insights = calculate_country_insights(country_data, country)
-                    st.markdown("### Key Insights")
-                    for insight in insights:
+                            if len(country_data) > 30:
+                                weekend_effect = analyze_weekend_effect(country_data, metric_column)
+                                if weekend_effect and abs(weekend_effect['weekend_effect_pct']) > 10:
+                                    effect_type = "lower" if weekend_effect['weekend_effect_pct'] < 0 else "higher"
+                                    st.markdown(f"- **{country}**: {effect_type} weekend reporting "
+                                              f"({weekend_effect['weekend_effect_pct']:.1f}%). "
+                                              f"Lowest on {weekend_effect['min_reporting_day']}.")
+                                waves = detect_covid_waves(country_data)
+                                if waves:
+                                    st.markdown(f"- **{country}**: {len(waves)} waves, highest peak on "
+                                              f"{waves[0]['wave_peak'].strftime('%Y-%m-%d')}.")
+                with trends_col2:
+                    st.markdown("### Data Quality Analysis")
+                    anomaly_counts = {}
+                    for country in selected_countries:
+                        country_data = filtered_df[filtered_df['location'] == country]
+                        country_data = detect_anomalies(country_data, metric_column, window=7)
+                        anomaly_count = country_data[f'{metric_column}_anomaly'].sum()
+                        if anomaly_count > 0:
+                            anomaly_counts[country] = anomaly_count
+                    if anomaly_counts:
+                        st.markdown("#### Anomalies Detected")
+                        for country, count in anomaly_counts.items():
+                            st.markdown(f"- **{country}**: {count} anomalous data points")
+                        st.markdown("Anomalies may indicate reporting issues or significant events.")
+                    else:
+                        st.markdown("No significant anomalies detected.")
+                    missing_data = {}
+                    for country in selected_countries:
+                        country_data = filtered_df[filtered_df['location'] == country]
+                        date_range = pd.date_range(start=country_data['date'].min(), end=country_data['date'].max())
+                        missing_dates = set(date_range) - set(country_data['date'])
+                        if missing_dates:
+                            missing_data[country] = len(missing_dates)
+                    if missing_data:
+                        st.markdown("#### Missing Data Points")
+                        for country, count in missing_data.items():
+                            st.markdown(f"- **{country}**: {count} missing dates")
+                        st.markdown("Missing data may affect trend analysis.")
+                    else:
+                        st.markdown("No missing dates detected.")
+        except Exception as e:
+            st.error(f"Error creating trends chart: {e}")
+        st.markdown("## Country-Specific Insights")
+        country_tabs = st.tabs(selected_countries)
+        for i, country in enumerate(selected_countries):
+            with country_tabs[i]:
+                country_data = filtered_df[filtered_df['location'] == country].sort_values('date')
+                if country_data.empty:
+                    st.warning("No data available for this country.")
+                    continue
+                metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
+                latest = country_data.iloc[-1]
+                with metrics_col1:
+                    st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                    st.markdown("<div class='metric-title'>Total Cases</div>", unsafe_allow_html=True)
+                    value = f"{int(latest['total_cases']):,}" if 'total_cases' in latest else "N/A"
+                    st.markdown(f"<div class='metric-value'>{value}</div>", unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with metrics_col2:
+                    st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                    st.markdown("<div class='metric-title'>Total Deaths</div>", unsafe_allow_html=True)
+                    value = f"{int(latest['total_deaths']):,}" if 'total_deaths' in latest else "N/A"
+                    st.markdown(f"<div class='metric-value'>{value}</div>", unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with metrics_col3:
+                    st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                    st.markdown("<div class='metric-title'>Case Fatality Rate</div>", unsafe_allow_html=True)
+                    cfr = (latest['total_deaths'] / latest['total_cases'] * 100) if 'total_cases' in latest and latest['total_cases'] > 0 else np.nan
+                    value = f"{cfr:.2f}%" if pd.notna(cfr) else "N/A"
+                    st.markdown(f"<div class='metric-value'>{value}</div>", unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                with metrics_col4:
+                    st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
+                    st.markdown("<div class='metric-title'>Vaccination Rate</div>", unsafe_allow_html=True)
+                    value = f"{latest['people_vaccinated_per_hundred']:.1f}%" if 'people_vaccinated_per_hundred' in latest and pd.notna(latest['people_vaccinated_per_hundred']) else "N/A"
+                    st.markdown(f"<div class='metric-value'>{value}</div>", unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                insights = calculate_country_insights(country_data, country)
+                st.markdown("### Key Insights")
+                for insight in insights:
+                    st.markdown(f"- {insight}")
+                if len(country_data) > 30:
+                    waves = detect_covid_waves(country_data)
+                    if waves:
+                        st.markdown("### COVID-19 Waves")
+                        for wave in waves:
+                            st.markdown(f"- Wave from {wave['wave_start'].strftime('%Y-%m-%d')} to "
+                                       f"{wave['wave_end'].strftime('%Y-%m-%d')}, peak on "
+                                       f"{wave['wave_peak'].strftime('%Y-%m-%d')} ({wave['peak_cases']:,.0f} cases)")
+    with tab2:
+        st.markdown("<h2 class='chart-header'>Statistical Analysis</h2>", unsafe_allow_html=True)
+        for country in selected_countries:
+            st.markdown(f"### {country}")
+            country_data = filtered_df[filtered_df['location'] == country]
+            stats_results, stats_insights = run_statistical_analysis(country_data, display_metric)
+            if stats_results:
+                stats_col1, stats_col2 = st.columns(2)
+                with stats_col1:
+                    st.markdown("#### Statistical Summary")
+                    st.markdown(f"- Mean: {stats_results['mean']:.2f}")
+                    st.markdown(f"- Median: {stats_results['median']:.2f}")
+                    st.markdown(f"- Standard Deviation: {stats_results['std_dev']:.2f}")
+                    st.markdown(f"- Skewness: {stats_results['skewness']:.2f}")
+                    st.markdown(f"- Kurtosis: {stats_results['kurtosis']:.2f}")
+                    if 'outliers' in stats_results:
+                        st.markdown(f"- Outliers: {stats_results['outliers']['count']} "
+                                   f"({stats_results['outliers']['percentage']:.1f}%)")
+                with stats_col2:
+                    st.markdown("#### Insights")
+                    for insight in stats_insights:
                         st.markdown(f"- {insight}")
-                    if len(country_data) > 30:
-                        waves = detect_covid_waves(country_data)
-                        if waves:
-                            st.markdown("### COVID-19 Waves")
-                            for wave in waves:
-                                st.markdown(f"- Wave from {wave['wave_start'].strftime('%Y-%m-%d')} to "
-                                           f"{wave['wave_end'].strftime('%Y-%m-%d')}, peak on "
-                                           f"{wave['wave_peak'].strftime('%Y-%m-%d')} ({wave['peak_cases']:,.0f} cases)")
-        with tab2:
-            st.markdown("<h2 class='chart-header'>Statistical Analysis</h2>", unsafe_allow_html=True)
-            for country in selected_countries:
-                st.markdown(f"### {country}")
-                country_data = filtered_df[filtered_df['location'] == country]
-                stats_results, stats_insights = run_statistical_analysis(country_data, display_metric)
-                if stats_results:
-                    stats_col1, stats_col2 = st.columns(2)
-                    with stats_col1:
-                        st.markdown("#### Statistical Summary")
-                        st.markdown(f"- Mean: {stats_results['mean']:.2f}")
-                        st.markdown(f"- Median: {stats_results['median']:.2f}")
-                        st.markdown(f"- Standard Deviation: {stats_results['std_dev']:.2f}")
-                        st.markdown(f"- Skewness: {stats_results['skewness']:.2f}")
-                        st.markdown(f"- Kurtosis: {stats_results['kurtosis']:.2f}")
-                        if 'outliers' in stats_results:
-                            st.markdown(f"- Outliers: {stats_results['outliers']['count']} "
-                                       f"({stats_results['outliers']['percentage']:.1f}%)")
-                    with stats_col2:
-                        st.markdown("#### Insights")
-                        for insight in stats_insights:
-                            st.markdown(f"- {insight}")
-                    if 'decomposition' in stats_results:
-                        fig_decomp = make_subplots(
-                            rows=3, cols=1, subplot_titles=("Trend", "Seasonal", "Residual"),
-                            shared_xaxes=True, vertical_spacing=0.1
-                        )
-                        fig_decomp.add_trace(go.Scatter(x=country_data['date'], y=stats_results['decomposition']['trend'], 
-                                                       name="Trend", line=dict(color='blue')), row=1, col=1)
-                        fig_decomp.add_trace(go.Scatter(x=country_data['date'], y=stats_results['decomposition']['seasonal'], 
-                                                       name="Seasonal", line=dict(color='green')), row=2, col=1)
-                        fig_decomp.add_trace(go.Scatter(x=country_data['date'], y=stats_results['decomposition']['residual'], 
-                                                       name="Residual", line=dict(color='red')), row=3, col=1)
-                        fig_decomp.update_layout(height=600, title_text=f"Time Series Decomposition for {country}")
-                        st.plotly_chart(fig_decomp, use_container_width=True)
-                else:
-                    st.warning(stats_insights)
-        with tab3:
-            st.markdown("<h2 class='chart-header'>Geographic Analysis</h2>", unsafe_allow_html=True)
-            if 'iso_code' in filtered_df.columns and 'total_cases_per_million' in filtered_df.columns:
-                latest_geo = filtered_df.sort_values('date').groupby('location').tail(1)
-                fig_geo = px.choropleth(
-                    latest_geo, locations='iso_code', color='total_cases_per_million',
-                    hover_name='location', color_continuous_scale=px.colors.sequential.Plasma,
-                    title='Global COVID-19 Cases per Million',
-                    labels={'total_cases_per_million': 'Cases per Million'}
-                )
-                fig_geo.update_layout(geo=dict(showframe=False, showcoastlines=True, projection_type='equirectangular'))
-                st.plotly_chart(fig_geo, use_container_width=True)
-                if 'total_deaths_per_million' in filtered_df.columns:
-                    fig_geo_deaths = px.choropleth(
-                        latest_geo, locations='iso_code', color='total_deaths_per_million',
-                        hover_name='location', color_continuous_scale=px.colors.sequential.Inferno,
-                        title='Global COVID-19 Deaths per Million',
-                        labels={'total_deaths_per_million': 'Deaths per Million'}
+                if 'decomposition' in stats_results:
+                    fig_decomp = make_subplots(
+                        rows=3, cols=1, subplot_titles=("Trend", "Seasonal", "Residual"),
+                        shared_xaxes=True, vertical_spacing=0.1
                     )
-                    fig_geo_deaths.update_layout(geo=dict(showframe=False, showcoastlines=True, projection_type='equirectangular'))
-                    st.plotly_chart(fig_geo_deaths, use_container_width=True)
+                    fig_decomp.add_trace(go.Scatter(x=country_data['date'], y=stats_results['decomposition']['trend'], 
+                                                   name="Trend", line=dict(color='blue')), row=1, col=1)
+                    fig_decomp.add_trace(go.Scatter(x=country_data['date'], y=stats_results['decomposition']['seasonal'], 
+                                                   name="Seasonal", line=dict(color='green')), row=2, col=1)
+                    fig_decomp.add_trace(go.Scatter(x=country_data['date'], y=stats_results['decomposition']['residual'], 
+                                                   name="Residual", line=dict(color='red')), row=3, col=1)
+                    fig_decomp.update_layout(height=600, title_text=f"Time Series Decomposition for {country}")
+                    st.plotly_chart(fig_decomp, use_container_width=True)
             else:
-                st.warning("Geographic data not available.")
-            regional_data = calculate_regional_patterns(filtered_df)
-            if regional_data is not None:
-                st.markdown("### Regional Patterns")
-                st.dataframe(regional_data[['continent', 'cases_per_million', 'deaths_per_million', 
-                                          'case_fatality_rate', 'cases_to_deaths_lag']].round(2))
-                fig_regional = px.bar(
-                    regional_data, x='continent', y=['cases_per_million', 'deaths_per_million'],
-                    barmode='group', title='Regional Comparison of Cases and Deaths per Million'
+                st.warning(stats_insights)
+    with tab3:
+        st.markdown("<h2 class='chart-header'>Geographic Analysis</h2>", unsafe_allow_html=True)
+        if 'iso_code' in filtered_df.columns and 'total_cases_per_million' in filtered_df.columns:
+            latest_geo = filtered_df.sort_values('date').groupby('location').tail(1)
+            fig_geo = px.choropleth(
+                latest_geo, locations='iso_code', color='total_cases_per_million',
+                hover_name='location', color_continuous_scale=px.colors.sequential.Plasma,
+                title='Global COVID-19 Cases per Million',
+                labels={'total_cases_per_million': 'Cases per Million'}
+            )
+            fig_geo.update_layout(geo=dict(showframe=False, showcoastlines=True, projection_type='equirectangular'))
+            st.plotly_chart(fig_geo, use_container_width=True)
+            if 'total_deaths_per_million' in filtered_df.columns:
+                fig_geo_deaths = px.choropleth(
+                    latest_geo, locations='iso_code', color='total_deaths_per_million',
+                    hover_name='location', color_continuous_scale=px.colors.sequential.Inferno,
+                    title='Global COVID-19 Deaths per Million',
+                    labels={'total_deaths_per_million': 'Deaths per Million'}
                 )
-                st.plotly_chart(fig_regional, use_container_width=True)
-        with tab4:
-            st.markdown("<h2 class='chart-header'>Comparative Analysis</h2>", unsafe_allow_html=True)
-            correlations, corr_insights = analyze_covid_impact_factors(filtered_df)
-            if correlations:
-                st.markdown("### Impact Factors")
-                corr_df = pd.DataFrame(correlations).round(3)
-                st.dataframe(corr_df)
-                st.markdown("#### Correlation Insights")
-                for insight in corr_insights:
-                    st.markdown(f"- {insight}")
-                fig_corr = px.bar(
-                    corr_df[corr_df['significance']], x='variable_1', y='correlation',
-                    color='variable_2', title='Significant Correlations with Outcomes'
+                fig_geo_deaths.update_layout(geo=dict(showframe=False, showcoastlines=True, projection_type='equirectangular'))
+                st.plotly_chart(fig_geo_deaths, use_container_width=True)
+        else:
+            st.warning("Geographic data not available.")
+        regional_data = calculate_regional_patterns(filtered_df)
+        if regional_data is not None:
+            st.markdown("### Regional Patterns")
+            st.dataframe(regional_data[['continent', 'cases_per_million', 'deaths_per_million', 
+                                      'case_fatality_rate', 'cases_to_deaths_lag']].round(2))
+            fig_regional = px.bar(
+                regional_data, x='continent', y=['cases_per_million', 'deaths_per_million'],
+                barmode='group', title='Regional Comparison of Cases and Deaths per Million'
+            )
+            st.plotly_chart(fig_regional, use_container_width=True)
+    with tab4:
+        st.markdown("<h2 class='chart-header'>Comparative Analysis</h2>", unsafe_allow_html=True)
+        correlations, corr_insights = analyze_covid_impact_factors(filtered_df)
+        if correlations:
+            st.markdown("### Impact Factors")
+            corr_df = pd.DataFrame(correlations).round(3)
+            st.dataframe(corr_df)
+            st.markdown("#### Correlation Insights")
+            for insight in corr_insights:
+                st.markdown(f"- {insight}")
+            fig_corr = px.bar(
+                corr_df[corr_df['significance']], x='variable_1', y='correlation',
+                color='variable_2', title='Significant Correlations with Outcomes'
+            )
+            st.plotly_chart(fig_corr, use_container_width=True)
+        vax_impact, vax_insights = analyze_vaccination_impact(filtered_df, selected_countries)
+        if vax_impact is not None:
+            st.markdown("### Vaccination Impact")
+            st.dataframe(vax_impact.round(2))
+            st.markdown("#### Vaccination Insights")
+            for insight in vax_insights:
+                st.markdown(f"- {insight}")
+            fig_vax = px.bar(
+                vax_impact, x='country', y=['new_cases_per_million_before', 'new_cases_per_million_after'],
+                barmode='group', title='Cases Before vs. After 20% Vaccination'
+            )
+            st.plotly_chart(fig_vax, use_container_width=True)
+        policy_impact, policy_insights = analyze_policy_impact(filtered_df, selected_countries)
+        if policy_impact is not None:
+            st.markdown("### Policy Impact")
+            st.dataframe(policy_impact.round(2))
+            st.markdown("#### Policy Insights")
+            for insight in policy_insights:
+                st.markdown(f"- {insight}")
+            fig_policy = px.bar(
+                policy_impact, x='country', y=['new_cases_per_million_high', 'new_cases_per_million_low'],
+                barmode='group', title='Cases Under High vs. Low Policy Stringency'
+            )
+            st.plotly_chart(fig_policy, use_container_width=True)
+    with tab5:
+        st.markdown("<h2 class='chart-header'>Forecasting & Modeling</h2>", unsafe_allow_html=True)
+        for country in selected_countries:
+            st.markdown(f"### {country} Forecast")
+            forecast_data, forecast_message = generate_advanced_forecasting(filtered_df, country, display_metric)
+            if forecast_data is not None:
+                fig_forecast = go.Figure()
+                fig_forecast.add_trace(go.Scatter(
+                    x=forecast_data['date'], y=forecast_data[display_metric], 
+                    name="Actual", line=dict(color='blue')
+                ))
+                fig_forecast.add_trace(go.Scatter(
+                    x=forecast_data['date'], y=forecast_data[f'{display_metric}_forecast'], 
+                    name="Forecast", line=dict(color='red', dash='dash')
+                ))
+                fig_forecast.add_trace(go.Scatter(
+                    x=forecast_data['date'], y=forecast_data['upper_bound'], 
+                    name="Upper CI", line=dict(color='rgba(255,0,0,0.2)'), fill='tonexty'
+                ))
+                fig_forecast.add_trace(go.Scatter(
+                    x=forecast_data['date'], y=forecast_data['lower_bound'], 
+                    name="Lower CI", line=dict(color='rgba(255,0,0,0.2)'), fill='tonexty'
+                ))
+                fig_forecast.update_layout(
+                    title=f"30-Day Forecast for {country} ({metric_title})",
+                    xaxis_title="Date", yaxis_title=metric_title
                 )
-                st.plotly_chart(fig_corr, use_container_width=True)
-            vax_impact, vax_insights = analyze_vaccination_impact(filtered_df, selected_countries)
-            if vax_impact is not None:
-                st.markdown("### Vaccination Impact")
-                st.dataframe(vax_impact.round(2))
-                st.markdown("#### Vaccination Insights")
-                for insight in vax_insights:
-                    st.markdown(f"- {insight}")
-                fig_vax = px.bar(
-                    vax_impact, x='country', y=['new_cases_per_million_before', 'new_cases_per_million_after'],
-                    barmode='group', title='Cases Before vs. After 20% Vaccination'
+                st.plotly_chart(fig_forecast, use_container_width=True)
+                st.success(forecast_message)
+            else:
+                st.warning(forecast_message)
+        cluster_features = ['total_cases_per_million', 'total_deaths_per_million', 'case_fatality_rate']
+        valid_features = [f for f in cluster_features if f in filtered_df.columns]
+        if len(valid_features) >= 2:
+            clustered_data, centroids = cluster_countries(filtered_df, valid_features)
+            if clustered_data is not None:
+                st.markdown("### Country Clustering")
+                st.markdown("Countries grouped by similarity in pandemic metrics:")
+                for centroid in centroids:
+                    countries_sample = ', '.join(centroid['countries'][:5])
+                    if len(centroid['countries']) > 5:
+                        countries_sample += f" and {len(centroid['countries'])-5} more"
+                    st.markdown(f"- **Cluster {centroid['cluster']+1}** ({centroid['size']} countries): {countries_sample}")
+                    for feature in valid_features:
+                        st.markdown(f"  - {feature}: {centroid[feature]:.2f}")
+                fig_cluster = px.scatter(
+                    clustered_data, x=valid_features[0], y=valid_features[1], 
+                    color='cluster', hover_name='location',
+                    title='Country Clusters Based on Pandemic Metrics'
                 )
-                st.plotly_chart(fig_vax, use_container_width=True)
-            policy_impact, policy_insights = analyze_policy_impact(filtered_df, selected_countries)
-            if policy_impact is not None:
-                st.markdown("### Policy Impact")
-                st.dataframe(policy_impact.round(2))
-                st.markdown("#### Policy Insights")
-                for insight in policy_insights:
-                    st.markdown(f"- {insight}")
-                fig_policy = px.bar(
-                    policy_impact, x='country', y=['new_cases_per_million_high', 'new_cases_per_million_low'],
-                    barmode='group', title='Cases Under High vs. Low Policy Stringency'
-                )
-                st.plotly_chart(fig_policy, use_container_width=True)
-        with tab5:
-            st.markdown("<h2 class='chart-header'>Forecasting & Modeling</h2>", unsafe_allow_html=True)
-            for country in selected_countries:
-                st.markdown(f"### {country} Forecast")
-                forecast_data, forecast_message = generate_advanced_forecasting(filtered_df, country, display_metric)
-                if forecast_data is not None:
-                    fig_forecast = go.Figure()
-                    fig_forecast.add_trace(go.Scatter(
-                        x=forecast_data['date'], y=forecast_data[display_metric], 
-                        name="Actual", line=dict(color='blue')
-                    ))
-                    fig_forecast.add_trace(go.Scatter(
-                        x=forecast_data['date'], y=forecast_data[f'{display_metric}_forecast'], 
-                        name="Forecast", line=dict(color='red', dash='dash')
-                    ))
-                    fig_forecast.add_trace(go.Scatter(
-                        x=forecast_data['date'], y=forecast_data['upper_bound'], 
-                        name="Upper CI", line=dict(color='rgba(255,0,0,0.2)'), fill='tonexty'
-                    ))
-                    fig_forecast.add_trace(go.Scatter(
-                        x=forecast_data['date'], y=forecast_data['lower_bound'], 
-                        name="Lower CI", line=dict(color='rgba(255,0,0,0.2)'), fill='tonexty'
-                    ))
-                    fig_forecast.update_layout(
-                        title=f"30-Day Forecast for {country} ({metric_title})",
-                        xaxis_title="Date", yaxis_title=metric_title
-                    )
-                    st.plotly_chart(fig_forecast, use_container_width=True)
-                    st.success(forecast_message)
-                else:
-                    st.warning(forecast_message)
-            cluster_features = ['total_cases_per_million', 'total_deaths_per_million', 'case_fatality_rate']
-            valid_features = [f for f in cluster_features if f in filtered_df.columns]
-            if len(valid_features) >= 2:
-                clustered_data, centroids = cluster_countries(filtered_df, valid_features)
-                if clustered_data is not None:
-                    st.markdown("### Country Clustering")
-                    st.markdown("Countries grouped by similarity in pandemic metrics:")
-                    for centroid in centroids:
-                        countries_sample = ', '.join(centroid['countries'][:5])
-                        if len(centroid['countries']) > 5:
-                            countries_sample += f" and {len(centroid['countries'])-5} more"
-                        st.markdown(f"- **Cluster {centroid['cluster']+1}** ({centroid['size']} countries): {countries_sample}")
-                        for feature in valid_features:
-                            st.markdown(f"  - {feature}: {centroid[feature]:.2f}")
-                    fig_cluster = px.scatter(
-                        clustered_data, x=valid_features[0], y=valid_features[1], 
-                        color='cluster', hover_name='location',
-                        title='Country Clusters Based on Pandemic Metrics'
-                    )
-                    st.plotly_chart(fig_cluster, use_container_width=True)
-        st.sidebar.header("📥 Download Data")
-        csv = filtered_df.to_csv(index=False)
-        b64 = base64.b64encode(csv.encode()).decode()
-        href = f'<a href="data:file/csv;base64,{b64}" download="covid_filtered_data.csv">Download filtered data as CSV</a>'
-        st.sidebar.markdown(href, unsafe_allow_html=True)
+                st.plotly_chart(fig_cluster, use_container_width=True)
+                
+    st.sidebar.header("🛠 Admin Controls")
+    if st.sidebar.button("Refresh Data"):
+        st.cache_data.clear()
+        if os.path.exists("covid_data_cache.parquet"):
+            os.remove("covid_data_cache.parquet")
+        st.rerun()
+    st.sidebar.header("📥 Download Data")
+    csv = filtered_df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="covid_filtered_data.csv">Download filtered data as CSV</a>'
+    st.sidebar.markdown(href, unsafe_allow_html=True)
 except Exception as e:
     st.error(f"An error occurred: {e}")
     st.error(traceback.format_exc())
