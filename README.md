@@ -115,7 +115,7 @@ streamlit run app.py
 ```
 
 Open http://localhost:8501 in your browser and use the interactive filters to explore the data.
-[Live demo of the project](https://tweenwrld-covid-19-global-tracker-appapp-qrgjwe.streamlit.app/)
+[Live demo of the project]
 
 ### Jupyter Notebook
 
